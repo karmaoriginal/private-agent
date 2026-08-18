@@ -55,7 +55,7 @@
             android:launchMode="singleTop"
             android:taskAffinity=""
             android:theme="@style/LaunchTheme"
-            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:configChanges="orientation|keyboardHidden|keyboard|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
             android:hardwareAccelerated="true"
             android:windowSoftInputMode="adjustResize">
             <meta-data
@@ -73,6 +73,33 @@
                 <action android:name="com.orailnoor.privateagent.REGISTER_BACKGROUND_CHANNELS" />
             </intent-filter>
         </receiver>
+
+        <!-- Voice Interaction Service (asistente por defecto) -->
+        <service
+            android:name=".AgentVoiceInteractionService"
+            android:exported="true"
+            android:permission="android.permission.BIND_VOICE_INTERACTION">
+            <intent-filter>
+                <action android:name="android.service.voice.VoiceInteractionService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.voice_interaction_service"
+                android:resource="@xml/interaction_service" />
+        </service>
+
+        <!-- Proveedor propio de reconocimiento de voz -->
+        <service
+            android:name=".AgentRecognitionService"
+            android:exported="true"
+            android:permission="android.permission.BIND_RECOGNITION_SERVICE">
+            <intent-filter>
+                <action android:name="android.speech.RecognitionService" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <meta-data
+                android:name="android.speech.recognition_service"
+                android:resource="@xml/recognition_service" />
+        </service>
 
         <!-- Provide required meta-data for flutter -->
 
