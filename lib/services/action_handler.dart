@@ -1,3 +1,4 @@
+import 'package:http/http.dart' as http;
 import '../models/agent_action.dart';
 import '../models/chat_message.dart';
 import 'app_launcher_service.dart';
@@ -248,25 +249,17 @@ class ActionHandler {
 
   /// Minimal HTML -> text for browse_page when CamoFox is not configured.
   Future<String> _fetchPlainText(String url) async {
-    final client = HttpClientWithTimeout();
-    return client.fetch(url);
-  }
-
-  /// Cancel the currently running task
-  void cancelTask() {
-    _currentExecutor?.cancel();
-  }
-}
-
-/// Tiny helper kept separate so ActionHandler stays readable.
-class HttpClientWithTimeout {
-  Future<String> fetch(String url) async {
     final uri = Uri.tryParse(url);
     if (uri == null || !uri.hasScheme) {
       throw Exception('Invalid URL: $url');
     }
-    final response = await _get(uri);
-    var text = response;
+    final response = await http
+        .get(uri, headers: {'User-Agent': 'PrivateAgent/1.0'})
+        .timeout(const Duration(seconds: 30));
+    if (response.statusCode != 200) {
+      throw Exception('HTTP ${response.statusCode} fetching $url');
+    }
+    var text = response.body;
     text = text.replaceAll(
       RegExp(r'<script[\s\S]*?</script>', caseSensitive: false),
       ' ',
@@ -284,16 +277,8 @@ class HttpClientWithTimeout {
     return text;
   }
 
-  Future<String> _get(Uri uri) async {
-    final client = 
-        (await _httpGet(uri).timeout(const Duration(seconds: 30)));
-    return client;
-  }
-
-  Future<String> _httpGet(Uri uri) async {
-    // Deferred import of package:http to keep one HTTP stack.
-    // ignore: avoid_dynamic_calls
-    final response = await (await _Http.get(uri));
-    return response;
+  /// Cancel the currently running task
+  void cancelTask() {
+    _currentExecutor?.cancel();
   }
 }

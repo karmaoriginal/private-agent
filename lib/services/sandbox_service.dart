@@ -80,7 +80,7 @@ class SandboxService {
     }
     throw Exception(
       'Sandbox did not accept the command ($lastError). The server at '
-      '$_baseUrl is alive but none of /execute, /run or /exist responded — '
+      '$_baseUrl is alive but none of /execute, /run or /exec responded — '
       'check which routes your sandbox server exposes.',
     );
   }
