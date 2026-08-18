@@ -4,15 +4,20 @@ import 'dart:developer' as developer;
 import 'dart:ui';
 import 'package:flutter/material.dart';
 import '../models/chat_message.dart';
+import '../models/chat_attachment.dart';
 import '../services/ai_service.dart';
 import '../services/action_handler.dart';
 import '../services/voice_service.dart';
+import '../services/attachment_service.dart';
 import '../widgets/message_bubble.dart';
+import '../widgets/model_picker_sheet.dart';
 import '../services/telegram_service.dart';
 import '../services/chat_history_service.dart';
 import '../services/notification_service.dart';
+import '../core/error_formatter.dart';
 import 'settings_screen.dart';
 import 'task_history_screen.dart';
+import 'integrations_screen.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
 import '../main.dart';
 import '../config/feature_flags.dart';
@@ -30,10 +35,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final AiService _aiService = AiService();
   final ActionHandler _actionHandler = ActionHandler();
   final VoiceService _voiceService = VoiceService();
+  final AttachmentService _attachmentService = AttachmentService();
   final NotificationService _notificationService = NotificationService();
   late final TelegramService _telegramService;
 
   final List<ChatMessage> _messages = [];
+  final List<ChatAttachment> _pendingAttachments = [];
   bool _isLoading = false;
   bool _isListening = false;
 
@@ -54,7 +61,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _telegramService = TelegramService(_actionHandler, _aiService);
     _initServices();
     _startOverlayHistorySync();
-    // Register as the handler for overlay bubble tasks
     onOverlayTask = (task) => _sendMessage(task);
   }
 
@@ -73,7 +79,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _saveSession() async {
     if (_messages.isEmpty) return;
 
-    // Set first user message as session title if not set
     if (_sessionTitle.isEmpty) {
       final firstUserMsg = _messages.firstWhere(
         (m) => m.isUser,
@@ -94,12 +99,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     await ChatHistoryService.saveSession(session);
   }
 
-  Future<void> _sendMessage(String text) async {
-    if (text.trim().isEmpty) return;
+  Future<void> _sendMessage(
+    String text, {
+    List<ChatAttachment> attachments = const [],
+  }) async {
+    if (text.trim().isEmpty && attachments.isEmpty) return;
 
-    final userMessage = ChatMessage(role: 'user', content: text.trim());
+    final sentAttachments = List<ChatAttachment>.of(attachments);
+    final userMessage = ChatMessage(
+      role: 'user',
+      content: text.trim(),
+      attachments: sentAttachments,
+    );
     setState(() {
       _messages.add(userMessage);
+      _pendingAttachments.clear();
       _isLoading = true;
     });
     _updateOverlayState();
@@ -114,10 +128,29 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     });
     final assistantIndex = _messages.length - 1;
 
+    String accumulated = '';
+    String thinking = '';
+
     try {
       final isAgent = _mode == 'agent';
       final stream = _aiService
-          .sendMessageStream(text.trim(), isAgentMode: isAgent)
+          .sendMessageStream(
+            text.trim(),
+            isAgentMode: isAgent,
+            attachments: sentAttachments,
+            onThinking: (t) {
+              thinking = t;
+              if (mounted) {
+                setState(() {
+                  _messages[assistantIndex] = ChatMessage(
+                    role: 'assistant',
+                    content: accumulated,
+                    thinking: thinking,
+                  );
+                });
+              }
+            },
+          )
           .timeout(
             const Duration(seconds: 90),
             onTimeout: (sink) {
@@ -129,7 +162,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               sink.close();
             },
           );
-      String accumulated = '';
 
       await for (final chunk in stream) {
         accumulated += chunk;
@@ -138,6 +170,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             _messages[assistantIndex] = ChatMessage(
               role: 'assistant',
               content: accumulated,
+              thinking: thinking.isEmpty ? null : thinking,
             );
           });
           _scrollToBottom();
@@ -154,17 +187,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           _messages.removeAt(assistantIndex);
         });
 
-        // Only multi-step tasks actually have "steps" in between (via
-        // onProgress). For simple one-shot actions (open_app, set_alarm...)
-        // there's nothing to run in between, so we keep those as a single
-        // combined message like before instead of splitting into three.
         final isMultiStepTask = action.action == 'execute_task';
 
-        // 1. Send the AI's own message FIRST, immediately — before any
-        // steps run — instead of holding it back to show only at the end.
-        // For a multi-step task this reads like "On it, opening WhatsApp
-        // now..." followed by the progress steps, then a separate message
-        // once it's actually done.
+        // 1. Send the AI's own message FIRST, before any steps run.
         final hasIntro = isMultiStepTask && action.response.trim().isNotEmpty;
         if (hasIntro && mounted) {
           setState(() {
@@ -177,8 +202,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
         await _showTaskProgressOverlay('Starting: ${text.trim()}');
 
-        // 2. Execute the action (pass aiService for multi-step tasks) —
-        // progress bubbles appear here via onProgress.
+        // 2. Execute the action — progress bubbles appear via onProgress.
         final result = await _actionHandler.execute(
           action,
           aiService: _aiService,
@@ -196,12 +220,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           },
         );
 
-        // 3. A distinct closing message once the task is actually
-        // finished. Multi-step tasks already showed their intro message in
-        // step 1, so the closing message uses the task's own completion
-        // result instead of repeating it. Simple one-shot actions keep the
-        // original single-message behavior (prefer the AI's natural-language
-        // response, fall back to the mechanical result details).
+        // 3. Closing message once the action is finished.
         final String closingText;
         if (isMultiStepTask) {
           closingText = result.success
@@ -245,7 +264,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         }
         await _saveSession();
       } else {
-        // Plain text response, we already rendered it, just speak it
+        // Plain text response — already rendered; speak it (the voice
+        // service strips markdown and reads emojis by name).
         _voiceService.speak(accumulated);
       }
     } catch (e) {
@@ -257,7 +277,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           _messages.add(
             ChatMessage(
               role: 'assistant',
-              content: 'Error: ${e.toString().replaceFirst('Exception: ', '')}',
+              content: ErrorFormatter.friendly(e),
+              isError: true,
             ),
           );
         });
@@ -273,12 +294,96 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
+  // ─── Attachments ──────────────────────────────────────────────────
+
+  void _showAttachmentPicker() {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    showModalBottomSheet(
+      context: context,
+      showDragHandle: true,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: Icon(Icons.photo_library_rounded,
+                  color: Theme.of(context).colorScheme.primary),
+              title: const Text('Photo from gallery'),
+              subtitle: const Text('The model can analyze the image'),
+              onTap: () async {
+                Navigator.pop(context);
+                final a = await _attachmentService.pickImage();
+                if (a != null) setState(() => _pendingAttachments.add(a));
+              },
+            ),
+            ListTile(
+              leading: Icon(Icons.photo_camera_rounded,
+                  color: Theme.of(context).colorScheme.primary),
+              title: const Text('Take a photo'),
+              onTap: () async {
+                Navigator.pop(context);
+                final a =
+                    await _attachmentService.pickImage(fromCamera: true);
+                if (a != null) setState(() => _pendingAttachments.add(a));
+              },
+            ),
+            ListTile(
+              leading: Icon(Icons.attach_file_rounded,
+                  color: Theme.of(context).colorScheme.primary),
+              title: const Text('File'),
+              subtitle: const Text('Text files are read directly into the chat'),
+              onTap: () async {
+                Navigator.pop(context);
+                final a = await _attachmentService.pickFile();
+                if (a != null) setState(() => _pendingAttachments.add(a));
+              },
+            ),
+            SizedBox(height: isDark ? 8 : 16),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPendingAttachments(bool isDark) {
+    if (_pendingAttachments.isEmpty) return const SizedBox.shrink();
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
+      child: Wrap(
+        spacing: 8,
+        runSpacing: 4,
+        children: [
+          for (var i = 0; i < _pendingAttachments.length; i++)
+            Chip(
+              avatar: Icon(
+                _pendingAttachments[i].isImage
+                    ? Icons.image_rounded
+                    : Icons.insert_drive_file_rounded,
+                size: 14,
+              ),
+              label: Text(
+                _pendingAttachments[i].name,
+                style: const TextStyle(fontSize: 11),
+                overflow: TextOverflow.ellipsis,
+              ),
+              deleteIcon: const Icon(Icons.close_rounded, size: 14),
+              onDeleted: () => setState(() => _pendingAttachments.removeAt(i)),
+              visualDensity: VisualDensity.compact,
+              backgroundColor: isDark
+                  ? const Color(0xFF1E293B)
+                  : const Color(0xFFF1F5F9),
+            ),
+        ],
+      ),
+    );
+  }
+
+  // ─── Overlay helpers (unchanged behavior) ─────────────────────────
+
   Future<void> _showTaskProgressOverlay(String message) async {
     if (!FeatureFlags.floatingOverlayEnabled) return;
     if (!await FlutterOverlayWindow.isPermissionGranted()) return;
-
-    // Never cover PrivateAgent itself. The lifecycle observer will create the
-    // overlay after an automated action moves this app to the background.
     if (_appLifecycleState != AppLifecycleState.paused) return;
 
     if (!await FlutterOverlayWindow.isActive()) {
@@ -297,8 +402,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       await Future<void>.delayed(const Duration(milliseconds: 300));
     }
 
-    // Keep the overlay minimized during automation. The user can still tap the
-    // bubble to open the full conversation whenever they choose.
     _sendOverlayEvent('OVERLAY_TASK_STARTED', message);
   }
 
@@ -351,6 +454,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       onResult: (text) {
         _sendMessage(text);
       },
+      onPartial: (partial) {
+        // Live transcription preview in the input field.
+        if (mounted && _isListening) {
+          _textController.text = partial;
+          _textController.selection = TextSelection.fromPosition(
+            TextPosition(offset: _textController.text.length),
+          );
+        }
+      },
       onDone: () {
         if (mounted) {
           setState(() => _isListening = false);
@@ -364,6 +476,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _sessionId = DateTime.now().millisecondsSinceEpoch.toString();
       _sessionTitle = '';
       _messages.clear();
+      _pendingAttachments.clear();
       _aiService.clearHistory();
     });
   }
@@ -379,11 +492,37 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
       _aiService.clearHistory();
       for (final m in _messages) {
-        if (m.actionResult != null) continue;
+        if (m.actionResult != null || m.isError) continue;
         _aiService.addHistoryMessage(m.role, m.content);
       }
     });
     _scrollToBottom();
+  }
+
+  Future<void> _openSettings() async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => SettingsScreen(
+          aiService: _aiService,
+          shizukuService: _actionHandler.shizuku,
+          screenAutomationService: _actionHandler.screenAutomation,
+          telegramService: _telegramService,
+        ),
+      ),
+    );
+    await _actionHandler.shizuku.checkAvailability();
+    await _voiceService.reloadSettings();
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _openIntegrations() async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const IntegrationsScreen()),
+    );
+    await _voiceService.reloadSettings();
+    if (mounted) setState(() {});
   }
 
   @override
@@ -439,7 +578,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
       final imported = handoff.map(ChatMessage.fromJson).toList();
       for (final message in imported) {
-        if (message.actionResult == null) {
+        if (message.actionResult == null && !message.isError) {
           _aiService.addHistoryMessage(message.role, message.content);
         }
       }
@@ -487,10 +626,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         height: 56,
       );
       if (_isLoading && _appLifecycleState == AppLifecycleState.paused) {
-        // Give the overlay isolate time to attach its listener, then send the
-        // full active conversation. A second snapshot makes cold starts
-        // reliable without duplicating messages because the overlay replaces
-        // its list atomically.
         await Future<void>.delayed(const Duration(milliseconds: 250));
         await _sendOverlayHistorySnapshot();
         await Future<void>.delayed(const Duration(milliseconds: 250));
@@ -557,36 +692,25 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           ),
         ),
         actions: [
+          // Quick model switcher — no need to dig into Settings
+          ModelPickerButton(
+            aiService: _aiService,
+            onChanged: () => setState(() {}),
+          ),
           IconButton(
             icon: const Icon(Icons.add_comment_outlined),
             tooltip: 'New chat',
             onPressed: _isLoading ? null : _startNewChat,
           ),
-          // Settings Action
           IconButton(
             icon: const Icon(Icons.settings_rounded),
-            onPressed: () async {
-              await Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (_) => SettingsScreen(
-                    aiService: _aiService,
-                    shizukuService: _actionHandler.shizuku,
-                    screenAutomationService: _actionHandler.screenAutomation,
-                    telegramService: _telegramService,
-                  ),
-                ),
-              );
-              await _actionHandler.shizuku.checkAvailability();
-              if (mounted) setState(() {});
-            },
+            onPressed: _openSettings,
           ),
         ],
       ),
       drawer: _buildDrawer(context, isDark),
       body: Stack(
         children: [
-          // Background mesh glows
           _buildBackgroundGlows(isDark),
 
           Positioned.fill(
@@ -598,10 +722,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
           Column(
             children: [
-              // Pill selector switcher
               _buildModeSelector(isDark),
 
-              // API key warning banner
               if (!_aiService.isConfigured)
                 Container(
                   margin: const EdgeInsets.symmetric(
@@ -636,28 +758,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         ),
                       ),
                       TextButton(
-                        onPressed: () async {
-                          await Navigator.push(
-                            context,
-                            MaterialPageRoute(
-                              builder: (_) => SettingsScreen(
-                                aiService: _aiService,
-                                shizukuService: _actionHandler.shizuku,
-                                screenAutomationService:
-                                    _actionHandler.screenAutomation,
-                                telegramService: _telegramService,
-                              ),
-                            ),
-                          );
-                          if (mounted) setState(() {});
-                        },
+                        onPressed: _openSettings,
                         child: const Text('Configure'),
                       ),
                     ],
                   ),
                 ),
 
-              // Chat content area
               Expanded(
                 child: _messages.isEmpty
                     ? _buildEmptyState(isDark)
@@ -675,7 +782,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       ),
               ),
 
-              // Think loading indicator
               if (_isLoading)
                 Padding(
                   padding: const EdgeInsets.symmetric(
@@ -737,7 +843,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   ),
                 ),
 
-              // Custom Input bar
+              _buildPendingAttachments(isDark),
               _buildInputBar(isDark),
             ],
           ),
@@ -764,7 +870,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       backgroundColor: drawerBg,
       child: Column(
         children: [
-          // Drawer Header
           Container(
             padding: const EdgeInsets.only(
               top: 60,
@@ -786,7 +891,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ),
           ),
 
-          // New Chat Button
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
             child: Container(
@@ -808,7 +912,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 color: Colors.transparent,
                 child: InkWell(
                   onTap: () {
-                    Navigator.pop(context); // Close drawer
+                    Navigator.pop(context);
                     _startNewChat();
                   },
                   borderRadius: BorderRadius.circular(16),
@@ -822,7 +926,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                           color: Colors.white,
                           size: 16,
                         ),
-                        const SizedBox(width: 8),
+                        SizedBox(width: 8),
                         Text(
                           'New Chat',
                           style: TextStyle(
@@ -841,7 +945,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
           const Divider(indent: 16, endIndent: 16, height: 20),
 
-          // Section CHAT HISTORY
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 6),
             child: Align(
@@ -858,7 +961,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ),
           ),
 
-          // Chat Sessions List
           Expanded(
             child: FutureBuilder<List<ChatSession>>(
               future: ChatHistoryService.loadSessions(),
@@ -942,8 +1044,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                             if (isCurrent) {
                               _startNewChat();
                             }
-                            (context as Element)
-                                .markNeedsBuild(); // Re-trigger build refresh
+                            (context as Element).markNeedsBuild();
                           },
                         ),
                         onTap: () {
@@ -960,7 +1061,23 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
           const Divider(indent: 16, endIndent: 16, height: 20),
 
-          // Section TASKS & SETTINGS
+          ListTile(
+            horizontalTitleGap: 8,
+            leading: Icon(
+              Icons.hub_outlined,
+              color: isDark ? Colors.grey[400] : Colors.grey[600],
+              size: 20,
+            ),
+            title: Text('Integrations', style: textStyle),
+            subtitle: const Text(
+              'Voice, search, sandbox, MCP',
+              style: TextStyle(fontSize: 11),
+            ),
+            onTap: () {
+              Navigator.pop(context);
+              _openIntegrations();
+            },
+          ),
           ListTile(
             horizontalTitleGap: 8,
             leading: Icon(
@@ -987,17 +1104,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             title: Text('Settings', style: textStyle),
             onTap: () {
               Navigator.pop(context);
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (_) => SettingsScreen(
-                    aiService: _aiService,
-                    shizukuService: _actionHandler.shizuku,
-                    screenAutomationService: _actionHandler.screenAutomation,
-                    telegramService: _telegramService,
-                  ),
-                ),
-              );
+              _openSettings();
             },
           ),
           const SizedBox(height: 20),
@@ -1177,9 +1284,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             'Write a poem about robots',
           ]
         : [
+            'Search the web for today\'s news',
             'Open YouTube and search for cats',
             'Call Mom',
-            'Set volume to 80%',
             'What\'s on my screen?',
           ];
 
@@ -1306,7 +1413,39 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       decoration: const BoxDecoration(color: Colors.transparent),
       child: Row(
         children: [
-          // Glowing Voice Mic button
+          // Attach files / photos
+          Container(
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: _pendingAttachments.isNotEmpty
+                  ? Theme.of(context).colorScheme.primary.withOpacity(0.12)
+                  : Theme.of(context).cardTheme.color,
+              border: Border.all(
+                color: _pendingAttachments.isNotEmpty
+                    ? Theme.of(context).colorScheme.primary.withOpacity(0.4)
+                    : Theme.of(context).colorScheme.onSurface.withOpacity(0.08),
+                width: 1.2,
+              ),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withOpacity(isDark ? 0.2 : 0.03),
+                  blurRadius: 8,
+                  offset: const Offset(0, 4),
+                ),
+              ],
+            ),
+            child: IconButton(
+              icon: Icon(
+                Icons.add_rounded,
+                color: Theme.of(context).colorScheme.primary,
+              ),
+              tooltip: 'Attach a photo or file',
+              onPressed: _isLoading ? null : _showAttachmentPicker,
+            ),
+          ),
+          const SizedBox(width: 8),
+
+          // Voice mic
           AnimatedContainer(
             duration: const Duration(milliseconds: 300),
             decoration: BoxDecoration(
@@ -1346,7 +1485,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           ),
           const SizedBox(width: 10),
 
-          // Custom Text input container
+          // Text input
           Expanded(
             child: Container(
               decoration: BoxDecoration(
@@ -1389,11 +1528,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       textInputAction: TextInputAction.send,
                       onSubmitted: _isLoading
                           ? null
-                          : (text) => _sendMessage(text),
+                          : (text) => _sendMessage(
+                                text,
+                                attachments: List.of(_pendingAttachments),
+                              ),
                     ),
                   ),
 
-                  // Solid Send button
                   Container(
                     margin: const EdgeInsets.only(right: 6),
                     decoration: BoxDecoration(
@@ -1408,7 +1549,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       ),
                       onPressed: _isLoading
                           ? null
-                          : () => _sendMessage(_textController.text),
+                          : () => _sendMessage(
+                                _textController.text,
+                                attachments: List.of(_pendingAttachments),
+                              ),
                     ),
                   ),
                 ],
