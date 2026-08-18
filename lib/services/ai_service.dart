@@ -3,16 +3,20 @@ import 'dart:developer' as developer;
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/agent_action.dart';
+import '../models/chat_attachment.dart';
 
 class AiResponse {
   final String content;
   final int totalTokens;
-  AiResponse(this.content, this.totalTokens);
+
+  /// Reasoning produced by thinking models, kept separate from the
+  /// visible answer so the UI can show it collapsed.
+  final String? thinking;
+
+  AiResponse(this.content, this.totalTokens, {this.thinking});
 }
 
 /// Thrown when the AI provider responds with HTTP 429 (rate limited).
-/// Carries the provider's suggested wait time when it sends a Retry-After
-/// header, so callers can back off intelligently instead of guessing.
 class RateLimitException implements Exception {
   final String message;
   final Duration? retryAfter;
@@ -21,13 +25,26 @@ class RateLimitException implements Exception {
   String toString() => message;
 }
 
+/// A ready-made provider endpoint for the model picker / settings chips.
+class AiProviderPreset {
+  final String name;
+  final String baseUrl;
+  final String defaultModel;
+  final String? note;
+  const AiProviderPreset({
+    required this.name,
+    required this.baseUrl,
+    required this.defaultModel,
+    this.note,
+  });
+}
+
 class AiService {
   static const String _defaultBaseUrl = 'https://api.deepseek.com';
   static const String _defaultModel = 'deepseek-chat';
   static const String nvidiaBaseUrl = 'https://integrate.api.nvidia.com/v1';
   static const String nvidiaDefaultModel = 'z-ai/glm-5.2';
 
-  // Extra "quick select" providers for the Settings screen.
   static const String openaiBaseUrl = 'https://api.openai.com/v1';
   static const String openaiDefaultModel = 'gpt-5.6-terra';
   static const String geminiBaseUrl =
@@ -37,9 +54,94 @@ class AiService {
   static const String anthropicDefaultModel = 'claude-sonnet-5';
   static const String _anthropicVersion = '2023-06-01';
 
-  /// Free, general-purpose chat endpoints verified in NVIDIA's NIM catalog.
-  /// The live /models response is intersected with this list so unavailable or
-  /// non-chat models never appear in PrivateAgent's NVIDIA model picker.
+  /// All built-in provider presets shown in the model picker.
+  static const List<AiProviderPreset> providerPresets = [
+    AiProviderPreset(
+      name: 'DeepSeek',
+      baseUrl: 'https://api.deepseek.com',
+      defaultModel: 'deepseek-chat',
+    ),
+    AiProviderPreset(
+      name: 'NVIDIA NIM',
+      baseUrl: nvidiaBaseUrl,
+      defaultModel: nvidiaDefaultModel,
+      note: 'Free tier available',
+    ),
+    AiProviderPreset(
+      name: 'OpenAI',
+      baseUrl: openaiBaseUrl,
+      defaultModel: openaiDefaultModel,
+    ),
+    AiProviderPreset(
+      name: 'Gemini',
+      baseUrl: geminiBaseUrl,
+      defaultModel: geminiDefaultModel,
+      note: 'OpenAI-compatible endpoint',
+    ),
+    AiProviderPreset(
+      name: 'Claude (Anthropic)',
+      baseUrl: anthropicBaseUrl,
+      defaultModel: anthropicDefaultModel,
+      note: 'Needs paid console.anthropic.com key',
+    ),
+    AiProviderPreset(
+      name: 'Groq',
+      baseUrl: 'https://api.groq.com/openai/v1',
+      defaultModel: 'llama-3.3-70b-versatile',
+      note: 'Very fast, free tier',
+    ),
+    AiProviderPreset(
+      name: 'OpenRouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      defaultModel: 'meta-llama/llama-3.3-70b-instruct:free',
+      note: 'One key, many providers',
+    ),
+    AiProviderPreset(
+      name: 'Mistral',
+      baseUrl: 'https://api.mistral.ai/v1',
+      defaultModel: 'mistral-small-latest',
+    ),
+    AiProviderPreset(
+      name: 'xAI (Grok)',
+      baseUrl: 'https://api.x.ai/v1',
+      defaultModel: 'grok-3-mini',
+    ),
+    AiProviderPreset(
+      name: 'Moonshot Kimi',
+      baseUrl: 'https://api.moonshot.ai/v1',
+      defaultModel: 'kimi-k2-0905-preview',
+    ),
+    AiProviderPreset(
+      name: 'Zhipu GLM',
+      baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
+      defaultModel: 'glm-4.5-flash',
+      note: 'Free tier available',
+    ),
+    AiProviderPreset(
+      name: 'Cerebras',
+      baseUrl: 'https://api.cerebras.ai/v1',
+      defaultModel: 'llama-3.3-70b',
+      note: 'Extremely fast, free tier',
+    ),
+    AiProviderPreset(
+      name: 'Together AI',
+      baseUrl: 'https://api.together.xyz/v1',
+      defaultModel: 'meta-llama/Llama-3.3-70B-Instruct-Turbo',
+    ),
+    AiProviderPreset(
+      name: 'Ollama Cloud',
+      baseUrl: 'https://ollama.com/v1',
+      defaultModel: 'gemma3:4b',
+    ),
+    AiProviderPreset(
+      name: 'Local server',
+      baseUrl: 'http://192.168.1.X:8080/v1',
+      defaultModel: 'local-model',
+      note: 'llama.cpp / LM Studio',
+    ),
+  ];
+
+  /// Free chat models verified in NVIDIA's NIM catalog.
   static const List<String> nvidiaFreeChatModels = [
     'z-ai/glm-5.2',
     'nvidia/nemotron-3-nano-30b-a3b',
@@ -62,10 +164,6 @@ class AiService {
     return uri?.host.toLowerCase() == 'integrate.api.nvidia.com';
   }
 
-  /// True when the base URL points at Anthropic's native Messages API, which
-  /// uses a different request/response shape (system as a top-level field,
-  /// x-api-key auth, content blocks in the reply) than the OpenAI-style
-  /// /chat/completions endpoint every other provider in this app speaks.
   static bool isAnthropicBaseUrl(String baseUrl) {
     final uri = Uri.tryParse(baseUrl.trim());
     return uri?.host.toLowerCase() == 'api.anthropic.com';
@@ -88,53 +186,68 @@ class AiService {
   bool _useScreenCompression = true;
   bool _useSystemPrompt = true;
   String _customSystemPrompt = '';
-  final List<Map<String, String>> _conversationHistory = [];
+  final List<Map<String, dynamic>> _conversationHistory = [];
 
   static const String _systemPrompt = '''
-You are PrivateAgent, a helpful AI assistant that controls an Android phone. You can perform device actions and also have normal conversations.
+You are PrivateAgent, a capable AI assistant that controls an Android phone. You can perform device actions, use external tools, and also have normal conversations.
 
-When the user wants to perform a device action, you MUST respond with ONLY a JSON object (no markdown, no code fences, no extra text) in this exact format:
+HOW TO RESPOND:
+- Normal conversation (questions, chat, writing, explanations): respond in plain text or markdown. Be direct, helpful and natural.
+- Device actions or tools: respond with ONLY a JSON object (no markdown, no code fences, no extra text):
 {"action": "action_name", "params": {"key": "value"}, "response": "What you say to the user"}
 
-Available actions and their params:
+SIMPLE DEVICE ACTIONS (single step only):
+- open_app: {"app_name": "YouTube"} - ONLY when the user JUST wants to open an app
+- launch_package: {"package_name": "com.example.app"} - open an app by its package id
+- make_call: {"contact_name": "Mom"} OR {"phone_number": "1234567890"}
+- send_sms: {"contact_name": "John", "message": "Hello"} OR {"phone_number": "123", "message": "Hi"}
+- send_email: {"to": "a@b.com", "subject": "Hi", "body": "..."}
+- search_contact: {"query": "John"}
+- set_alarm: {"hour": 7, "minute": 30, "label": "Wake up"}
+- set_timer: {"seconds": 300, "label": "Tea"}
+- set_volume: {"level": 50} - 0 to 100
+- set_brightness: {"level": 50} - 0 to 100
+- open_url: {"url": "https://example.com"} - opens in the phone browser
+- read_screen: {} - read what is currently on the phone screen
+- click_element: {"text": "Accept"} - tap an element by its text
+- type_on_screen: {"text": "hello", "field_hint": "Search"}
+- scroll_screen: {"direction": "down"} - up, down, left, right
+- press_back: {}
+- run_adb_command: {"command": "settings put global ..."} - via Shizuku, when available
 
-SIMPLE ACTIONS (single step only):
-- open_app: {"app_name": "YouTube"} - ONLY use this when the user JUST wants to open an app and nothing else
-- make_call: {"contact_name": "Mom"} OR {"phone_number": "1234567890"} - Makes a phone call
-- send_sms: {"contact_name": "John", "message": "Hello"} OR {"phone_number": "123", "message": "Hi"} - Sends SMS
-- search_contact: {"query": "John"} - Searches contacts
-- set_alarm: {"hour": 7, "minute": 30, "label": "Wake up"} - Sets an alarm
-- set_volume: {"level": 50} - Sets volume (0-100)
-- set_brightness: {"level": 50} - Sets brightness (0-100)
-- read_screen: {} - Read what's currently on the screen
-- press_back: {} - Press the back button
+WEB & KNOWLEDGE TOOLS:
+- web_search: {"query": "latest news about X"} - Search the web. ALWAYS use this for current events, prices, weather, "latest", "today", facts you are not sure about, or anything that may have changed. Never invent current data.
+- browse_page: {"url": "https://example.com/article"} - Open a web page and read its content (uses the configured CamoFox browser when available).
 
-MULTI-STEP TASK (for anything that requires more than one action):
-- execute_task: {"goal": "description of the full task"} - Automatically reads screen, taps, scrolls, types step by step
+CODE EXECUTION:
+- run_code: {"command": "python3 script.py", "language": "bash"} - Run a command in the remote sandbox server. Use it for calculations, file processing, scraping, or anything easier done with code. If it fails with a routing error, tell the user the sandbox server needs its API routes checked.
+
+MCP PLUGINS:
+- mcp_call: {"server": "server_name", "tool": "tool_name", "arguments": {...}} - Call a tool from a configured MCP plugin server. Only use servers/tools the user has configured; if unsure which exist, ask.
+
+MULTI-STEP TASK (anything requiring more than one device action):
+- execute_task: {"goal": "description of the full task"} - Automatically reads the screen, taps, scrolls and types step by step.
 
 CRITICAL RULES:
-1. If the user request contains "and" or involves MULTIPLE steps (open + search, open + send, open + find, etc.), you MUST use execute_task. NEVER use open_app for these.
+1. If the request contains "and" or involves MULTIPLE steps (open + search, open + send, open + find), you MUST use execute_task. NEVER use open_app for these.
 2. execute_task handles everything: opening apps, finding elements, clicking, typing, scrolling.
-3. The "response" field is shown to the user IMMEDIATELY, before execute_task starts running. Keep it short and forward-looking (e.g. "On it, opening WhatsApp now...") — it is not a place to report a result you don't have yet.
+3. The "response" field is shown to the user IMMEDIATELY, before the action runs. Keep it short and forward-looking ("On it, opening WhatsApp now...") — do not report results you do not have yet.
+4. When the user attaches images or files, analyze them directly and refer to them in your answer.
+5. Prefer tools over guessing: if you can verify something with web_search, do it.
+6. If a tool fails, explain the failure briefly and propose an alternative instead of retrying the same thing blindly.
 
-Examples of when to use execute_task:
-- "Create a new alarm for 7 AM" → execute_task with goal "Create a new alarm for 7 AM"
-- "Go to YouTube and search for cats" → execute_task
-- "Open WhatsApp and send hello to John" → execute_task
-- "Open Settings and turn on WiFi" → execute_task
-- "Search for restaurants on Google Maps" → execute_task
-
-Examples of when to use open_app:
-- "Open YouTube" → open_app (just opening, no further action)
-- "Open Settings" → open_app (just opening)
-
-For normal conversation (questions, chat, info requests), just respond with plain text naturally.
+Examples:
+- "Create a new alarm for 7 AM" -> execute_task with goal "Create a new alarm for 7 AM"
+- "Open YouTube" -> open_app (just opening, nothing else)
+- "What's the weather in Madrid today?" -> web_search
+- "Summarize this article: https://..." -> browse_page
 ''';
 
   static const String _chatSystemPrompt = '''
-You are PrivateAgent, a helpful conversational AI assistant. 
-Provide direct, natural, and friendly text responses. You cannot perform device actions or run tools. 
+You are PrivateAgent, a helpful conversational AI assistant.
+Provide direct, natural, and friendly text responses. You cannot perform device actions or run tools.
 Answer questions, explain concepts, brainstorm, write emails/messages, and chat with the user in plain text or markdown format.
+When the user attaches images or files, analyze them directly.
 ''';
 
   Future<void> init() async {
@@ -158,7 +271,6 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
   }) async {
     final prefs = await SharedPreferences.getInstance();
 
-    // Clean up the API key in case the user pasted "Bearer sk-..."
     String cleanApiKey = apiKey.trim();
     if (cleanApiKey.toLowerCase().startsWith('bearer ')) {
       cleanApiKey = cleanApiKey.substring(7).trim();
@@ -175,6 +287,18 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
       _model = model;
       await prefs.setString('api_model', model);
     }
+  }
+
+  /// Switches endpoint + model in one call (used by the model picker).
+  Future<void> selectModel({
+    required String baseUrl,
+    required String model,
+  }) async {
+    final prefs = await SharedPreferences.getInstance();
+    _baseUrl = baseUrl;
+    _model = model;
+    await prefs.setString('api_base_url', baseUrl);
+    await prefs.setString('api_model', model);
   }
 
   Future<void> saveMaxSteps(int steps) async {
@@ -206,9 +330,6 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     await prefs.setBool('api_use_system_prompt', useSystemPrompt);
   }
 
-  /// Saves an extra system prompt that is appended AFTER the app's built-in
-  /// system prompt (task or chat), for both multi-step tasks and normal chat.
-  /// It is not a replacement — it layers custom instructions on top.
   Future<void> saveCustomSystemPrompt(String prompt) async {
     final prefs = await SharedPreferences.getInstance();
     _customSystemPrompt = prompt.trim();
@@ -220,7 +341,7 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
   String get model => _model;
   String get apiKey => _apiKey ?? '';
   int get maxSteps => _disableMaxSteps ? 999 : _maxSteps;
-  int get rawMaxSteps => _maxSteps; // For the slider UI
+  int get rawMaxSteps => _maxSteps;
   bool get disableMaxSteps => _disableMaxSteps;
   double get temperature => _temperature;
   int get maxTokens => _maxTokens;
@@ -228,9 +349,17 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
   bool get useSystemPrompt => _useSystemPrompt;
   String get customSystemPrompt => _customSystemPrompt;
 
+  /// Display name of the provider matching the current base URL, if any.
+  String get providerName {
+    for (final p in providerPresets) {
+      final presetHost = Uri.tryParse(p.baseUrl)?.host;
+      final currentHost = Uri.tryParse(_baseUrl)?.host;
+      if (presetHost != null && presetHost == currentHost) return p.name;
+    }
+    return Uri.tryParse(_baseUrl)?.host ?? 'Custom';
+  }
+
   int get _effectiveMaxTokens {
-    // GLM is a reasoning model. With the app's 1,024-token default it can
-    // consume the whole budget reasoning and finish without visible content.
     if (isNvidiaBaseUrl(_baseUrl) &&
         _model == nvidiaDefaultModel &&
         _maxTokens < 4096) {
@@ -250,9 +379,6 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     }
   }
 
-  /// Appends the user's optional custom instructions after a base system
-  /// prompt (task or chat). Returns null when the "Send System Prompt"
-  /// toggle is off, so no system message is sent at all.
   String? _composeSystemPrompt(String basePrompt) {
     if (!_useSystemPrompt) return null;
     final custom = _customSystemPrompt.trim();
@@ -260,8 +386,6 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     return '$basePrompt\n\n--- Additional instructions from the user ---\n$custom';
   }
 
-  /// Parses a numeric Retry-After header (seconds). Non-numeric values
-  /// (HTTP-date form) are ignored in favor of the caller's own backoff.
   Duration? _parseRetryAfter(String? header) {
     if (header == null) return null;
     final seconds = int.tryParse(header.trim());
@@ -279,17 +403,10 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
           return decoded['error'] as String;
         }
       }
-    } catch (_) {
-      // Not JSON, fall through to the raw body.
-    }
+    } catch (_) {}
     return body;
   }
 
-  /// Retries transient failures. Rate limits (HTTP 429) get longer,
-  /// provider-aware backoff — honoring the Retry-After header when the
-  /// provider sends one — and more attempts than other network errors,
-  /// since a busy free-tier endpoint (e.g. NVIDIA NIM) usually recovers if
-  /// you wait long enough instead of aborting the whole task.
   Future<AiResponse> _sendWithRetry(
     Future<AiResponse> Function() call, {
     void Function(String)? onRetry,
@@ -309,8 +426,8 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
             'API error (429): ${e.message}. Gave up after $maxRateLimitRetries retries.',
           );
         }
-        final wait =
-            e.retryAfter ?? Duration(seconds: (12 * rateLimitAttempt).clamp(12, 60));
+        final wait = e.retryAfter ??
+            Duration(seconds: (12 * rateLimitAttempt).clamp(12, 60));
         developer.log(
           'Rate limited (429), retrying in ${wait.inSeconds}s ($rateLimitAttempt/$maxRateLimitRetries)',
           name: 'PrivateAgent',
@@ -339,10 +456,87 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     }
   }
 
-  /// Dispatches to the right wire format for the configured provider.
+  // ─── Message building (with attachments) ──────────────────────────
+
+  /// Builds the user message payload for the current request.
+  /// With no attachments this is a plain string map; with attachments it
+  /// uses the provider's multimodal content format.
+  Map<String, dynamic> _buildUserMessage(
+    String text,
+    List<ChatAttachment> attachments, {
+    required bool anthropic,
+  }) {
+    if (attachments.isEmpty) {
+      return {'role': 'user', 'content': text};
+    }
+
+    // Text-like attachments are inlined as extra context.
+    final buffer = StringBuffer(text);
+    final images = <ChatAttachment>[];
+    final noted = <String>[];
+    for (final a in attachments) {
+      if (a.isImage && a.base64Data != null) {
+        images.add(a);
+      } else if (a.isTextLike && a.textContent != null) {
+        buffer.writeln('\n\n--- Attached file: ${a.name} ---\n${a.textContent}');
+      } else {
+        noted.add('${a.name} (${a.mimeType}, ${a.humanSize})');
+      }
+    }
+    if (noted.isNotEmpty) {
+      buffer.writeln(
+        '\n\n[User attached files that cannot be read inline: ${noted.join(', ')}]',
+      );
+    }
+
+    if (images.isEmpty) {
+      return {'role': 'user', 'content': buffer.toString()};
+    }
+
+    if (anthropic) {
+      return {
+        'role': 'user',
+        'content': [
+          for (final img in images)
+            {
+              'type': 'image',
+              'source': {
+                'type': 'base64',
+                'media_type': img.mimeType,
+                'data': img.base64Data,
+              },
+            },
+          {'type': 'text', 'text': buffer.toString()},
+        ],
+      };
+    }
+
+    return {
+      'role': 'user',
+      'content': [
+        {'type': 'text', 'text': buffer.toString()},
+        for (final img in images)
+          {
+            'type': 'image_url',
+            'image_url': {
+              'url': 'data:${img.mimeType};base64,${img.base64Data}',
+            },
+          },
+      ],
+    };
+  }
+
+  String _historyLabel(String text, List<ChatAttachment> attachments) {
+    if (attachments.isEmpty) return text;
+    final names = attachments.map((a) => a.name).join(', ');
+    return '$text\n[attached: $names]';
+  }
+
+  // ─── Wire formats ─────────────────────────────────────────────────
+
   Future<AiResponse> _sendChatCompletion({
     required String? systemPrompt,
-    required List<Map<String, String>> messages,
+    required List<Map<String, dynamic>> messages,
     required int maxTokens,
   }) {
     if (isAnthropicBaseUrl(_baseUrl)) {
@@ -359,12 +553,9 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     );
   }
 
-  /// Any provider that speaks the OpenAI /chat/completions wire format
-  /// (DeepSeek, OpenRouter, Groq, Ollama, NVIDIA NIM, OpenAI, Gemini's
-  /// OpenAI-compatibility endpoint, local servers, etc).
   Future<AiResponse> _sendOpenAiCompatible({
     required String? systemPrompt,
-    required List<Map<String, String>> messages,
+    required List<Map<String, dynamic>> messages,
     required int maxTokens,
   }) async {
     final fullMessages = [
@@ -386,7 +577,7 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
           headers: {
             'Content-Type': 'application/json',
             'Authorization': 'Bearer $_apiKey',
-            'HTTP-Referer': 'https://github.com/orailnoor/private-agent',
+            'HTTP-Referer': 'https://github.com/karmaoriginal/private-agent',
             'X-Title': 'PrivateAgent',
           },
           body: jsonEncode({
@@ -416,9 +607,19 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     if (data is! Map<String, dynamic> || !data.containsKey('choices')) {
       throw Exception('Unexpected API response format: $data');
     }
-    String content = data['choices'][0]['message']['content'] as String? ?? '';
+    final message = data['choices'][0]['message'] as Map<String, dynamic>? ?? {};
+    String content = message['content'] as String? ?? '';
 
-    // Strip <think> blocks commonly produced by reasoning models
+    // Reasoning can arrive as a separate field and/or <think> blocks.
+    final buffer = StringBuffer();
+    final reasoning = message['reasoning_content'] ?? message['reasoning'];
+    if (reasoning is String && reasoning.isNotEmpty) buffer.write(reasoning);
+
+    final thinkMatch = RegExp(r'<think>([\s\S]*?)</think>').firstMatch(content);
+    if (thinkMatch != null) {
+      if (buffer.isNotEmpty) buffer.write('\n');
+      buffer.write(thinkMatch.group(1));
+    }
     content = content
         .replaceAll(RegExp(r'<think>.*?</think>', dotAll: true), '')
         .trim();
@@ -435,16 +636,13 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
         data['usage']['total_tokens'] != null) {
       tokens = data['usage']['total_tokens'] as int;
     }
-    return AiResponse(content, tokens);
+    final thinking = buffer.toString().trim();
+    return AiResponse(content, tokens, thinking: thinking.isEmpty ? null : thinking);
   }
 
-  /// Anthropic's native Messages API (api.anthropic.com). This is a
-  /// pay-per-token API key from console.anthropic.com — it is billed
-  /// separately from, and is NOT the same thing as, a Claude.ai Pro/Max
-  /// subscription, which does not expose API access.
   Future<AiResponse> _sendAnthropicMessages({
     required String? systemPrompt,
-    required List<Map<String, String>> messages,
+    required List<Map<String, dynamic>> messages,
     required int maxTokens,
   }) async {
     String cleanBase = _baseUrl.trim();
@@ -463,8 +661,6 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
       'model': _model,
       'max_tokens': maxTokens,
       'messages': messages,
-      // Anthropic's temperature range is 0.0-1.0, unlike some OpenAI-style
-      // providers that accept up to 2.0.
       'temperature': _temperature > 1.0 ? 1.0 : _temperature,
     };
     if (systemPrompt != null && systemPrompt.isNotEmpty) {
@@ -507,6 +703,11 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
         .map((b) => (b as Map)['text'] as String? ?? '')
         .join()
         .trim();
+    final thinking = blocks
+        .where((b) => b is Map && (b['type'] == 'thinking' || b['type'] == 'redacted_thinking'))
+        .map((b) => (b as Map)['thinking'] as String? ?? '')
+        .join()
+        .trim();
 
     if (text.isEmpty) {
       throw Exception(
@@ -521,20 +722,28 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
       final outputTokens = (usage['output_tokens'] as num?)?.toInt() ?? 0;
       tokens = inputTokens + outputTokens;
     }
-    return AiResponse(text, tokens);
+    return AiResponse(text, tokens, thinking: thinking.isEmpty ? null : thinking);
   }
 
-  /// Send a message to the AI and get a full (non-streaming) response.
-  /// Used by the Telegram remote-control integration.
-  Future<String> sendMessage(String message, {bool isAgentMode = true}) async {
+  /// Send a message and get a full (non-streaming) response.
+  Future<String> sendMessage(
+    String message, {
+    bool isAgentMode = true,
+    List<ChatAttachment> attachments = const [],
+  }) async {
     if (_apiKey == null || _apiKey!.isEmpty) {
       throw Exception('API Key is not configured. Please go to Settings.');
     }
 
-    // Add ONLY the text to the persistent conversation history to save tokens.
-    _conversationHistory.add({'role': 'user', 'content': message});
+    final anthropic = isAnthropicBaseUrl(_baseUrl);
+    _conversationHistory.add(
+      _buildUserMessage(
+        _historyLabel(message, attachments),
+        attachments,
+        anthropic: anthropic,
+      ),
+    );
 
-    // Keep conversation history manageable (last 20 messages)
     if (_conversationHistory.length > 20) {
       _conversationHistory.removeRange(0, _conversationHistory.length - 20);
     }
@@ -564,15 +773,26 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
   }
 
   /// Send a message and stream the response chunk-by-chunk.
+  /// [onThinking] receives the accumulated reasoning text as it grows
+  /// (null-capable; may never fire for non-reasoning models).
   Stream<String> sendMessageStream(
     String message, {
     bool isAgentMode = true,
+    List<ChatAttachment> attachments = const [],
+    void Function(String thinking)? onThinking,
   }) async* {
     if (_apiKey == null || _apiKey!.isEmpty) {
       throw Exception('API Key is not configured. Please go to Settings.');
     }
 
-    _conversationHistory.add({'role': 'user', 'content': message});
+    final anthropic = isAnthropicBaseUrl(_baseUrl);
+    _conversationHistory.add(
+      _buildUserMessage(
+        _historyLabel(message, attachments),
+        attachments,
+        anthropic: anthropic,
+      ),
+    );
 
     if (_conversationHistory.length > 20) {
       _conversationHistory.removeRange(0, _conversationHistory.length - 20);
@@ -581,11 +801,8 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     final basePrompt = isAgentMode ? _systemPrompt : _chatSystemPrompt;
     final composedSystem = _composeSystemPrompt(basePrompt);
 
-    // Anthropic's Messages API uses a different SSE event schema than the
-    // OpenAI-style delta stream below. Rather than duplicate a whole second
-    // stream parser, fetch the full response (with the same retry/backoff
-    // handling as everything else) and emit it as a single chunk.
-    if (isAnthropicBaseUrl(_baseUrl)) {
+    // Anthropic: fetch full response, emit as a single chunk.
+    if (anthropic) {
       try {
         final aiResponse = await _sendWithRetry(
           () => _sendAnthropicMessages(
@@ -594,6 +811,9 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
             maxTokens: _effectiveMaxTokens,
           ),
         );
+        if (aiResponse.thinking != null) {
+          onThinking?.call(aiResponse.thinking!);
+        }
         _conversationHistory.add({
           'role': 'assistant',
           'content': aiResponse.content,
@@ -620,10 +840,6 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
             : '$requestUrl/chat/completions';
       }
 
-      // Retry a rate-limited connection attempt (before any bytes have
-      // streamed back) a few times with backoff, same spirit as the
-      // non-streaming retry helper but kept lightweight since this is a
-      // single request/response, not a multi-step task loop.
       const int maxConnectAttempts = 3;
       int connectAttempt = 0;
       late http.Client client;
@@ -636,7 +852,7 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
         request.headers.addAll({
           'Content-Type': 'application/json',
           'Authorization': 'Bearer $_apiKey',
-          'HTTP-Referer': 'https://github.com/orailnoor/private-agent',
+          'HTTP-Referer': 'https://github.com/karmaoriginal/private-agent',
           'X-Title': 'PrivateAgent',
         });
         request.body = jsonEncode({
@@ -673,9 +889,9 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
       }
 
       final accumulatedContent = StringBuffer();
+      final accumulatedThinking = StringBuffer();
       bool inThinkBlock = false;
 
-      // Listen to response stream
       final lineStream = response.stream
           .transform(utf8.decoder)
           .transform(const LineSplitter());
@@ -695,27 +911,42 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
                 if (choice is! Map) continue;
                 final rawDelta = choice['delta'];
                 final delta = rawDelta is Map ? rawDelta : const {};
+
+                // Reasoning models (DeepSeek-R1, GLM, etc.) stream reasoning
+                // in a dedicated field — capture it as "thinking".
+                final reasoningDelta =
+                    delta['reasoning_content'] ?? delta['reasoning'];
+                if (reasoningDelta is String && reasoningDelta.isNotEmpty) {
+                  accumulatedThinking.write(reasoningDelta);
+                  onThinking?.call(accumulatedThinking.toString());
+                }
+
                 final rawContent = delta['content'];
                 if (rawContent is String && rawContent.isNotEmpty) {
                   final content = rawContent;
                   accumulatedContent.write(content);
 
-                  // Handle <think> block stripping on the fly for better stream styling
+                  // Inline <think> blocks also count as thinking.
                   if (content.contains('<think>')) {
                     inThinkBlock = true;
-                    // If there is text before <think>, yield it
                     final parts = content.split('<think>');
-                    if (parts[0].isNotEmpty) {
-                      yield parts[0];
+                    if (parts[0].isNotEmpty) yield parts[0];
+                    if (parts.length > 1) {
+                      accumulatedThinking.write(parts.sublist(1).join('<think>'));
+                      onThinking?.call(accumulatedThinking.toString());
                     }
                   } else if (content.contains('</think>')) {
                     inThinkBlock = false;
-                    // If there is text after </think>, yield it
                     final parts = content.split('</think>');
+                    accumulatedThinking.write(parts[0]);
+                    onThinking?.call(accumulatedThinking.toString());
                     if (parts.length > 1 && parts[1].isNotEmpty) {
                       yield parts[1];
                     }
-                  } else if (!inThinkBlock) {
+                  } else if (inThinkBlock) {
+                    accumulatedThinking.write(content);
+                    onThinking?.call(accumulatedThinking.toString());
+                  } else {
                     yield content;
                   }
                 }
@@ -730,7 +961,6 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
 
       client.close();
 
-      // Clean up final accumulated response and add to history
       String finalResponse = accumulatedContent.toString().trim();
       finalResponse = finalResponse
           .replaceAll(RegExp(r'<think>.*?</think>', dotAll: true), '')
@@ -739,7 +969,7 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
       if (finalResponse.isEmpty) {
         throw Exception(
           'The model finished without a visible answer. Increase Max Tokens '
-          'or try another NVIDIA model.',
+          'or try another model.',
         );
       }
       _conversationHistory.add({'role': 'assistant', 'content': finalResponse});
@@ -749,12 +979,7 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     }
   }
 
-  /// Send a task execution message — no conversation history, low temperature, limited tokens.
-  /// This is much faster and cheaper than sendMessage.
-  ///
-  /// [onRetry] is called (instead of throwing) whenever a transient failure
-  /// (e.g. a 429 rate limit) is being retried, so the caller can surface a
-  /// friendly progress message instead of a scary raw error mid-task.
+  /// Send a task execution message — no conversation history, limited tokens.
   Future<AiResponse> sendTaskMessage(
     String systemPrompt,
     String prompt, {
@@ -780,21 +1005,18 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
 
   /// Parse the AI response to check if it's an action or plain text
   AgentAction? parseAction(String response) {
-    // Try to parse as JSON action
     try {
       final trimmed = response.trim();
-      // Handle if the response is wrapped in code fences
       String jsonStr = trimmed;
       if (trimmed.startsWith('```')) {
         final lines = trimmed.split('\n');
-        lines.removeAt(0); // Remove opening fence
+        lines.removeAt(0);
         if (lines.isNotEmpty && lines.last.trim() == '```') {
-          lines.removeLast(); // Remove closing fence
+          lines.removeLast();
         }
         jsonStr = lines.join('\n').trim();
       }
 
-      // If it looks like JSON but is missing a closing brace (common with some local models)
       if (jsonStr.startsWith('{') && !jsonStr.endsWith('}')) {
         jsonStr += '\n}';
       }
@@ -806,7 +1028,6 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
             return AgentAction.fromJson(json);
           }
         } catch (e) {
-          // If it still fails, it might be deeply truncated, try adding another brace
           if (e.toString().contains('Unexpected end of input')) {
             jsonStr += '\n}';
             final json = jsonDecode(jsonStr) as Map<String, dynamic>;
@@ -816,9 +1037,7 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
           }
         }
       }
-    } catch (_) {
-      // Not JSON, it's plain text conversation
-    }
+    } catch (_) {}
     return null;
   }
 
@@ -829,7 +1048,6 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
   ) async {
     try {
       String cleanBaseUrl = baseUrl;
-      // Many providers host it at /models, but some require the base URL without /chat/completions logic
       if (cleanBaseUrl.endsWith('/chat/completions')) {
         cleanBaseUrl = cleanBaseUrl.replaceAll('/chat/completions', '');
       }
@@ -876,7 +1094,6 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
       }
       return [];
     } catch (e) {
-      print('Error fetching models: $e');
       return [];
     }
   }

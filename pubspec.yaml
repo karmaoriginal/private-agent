@@ -1,7 +1,7 @@
 name: private_agent
 description: "AI agent for Android"
 publish_to: "none"
-version: 1.0.2+2021
+version: 1.0.3+2022
 
 environment:
   sdk: ^3.10.3
@@ -16,6 +16,7 @@ dependencies:
   # Voice
   speech_to_text: ^7.0.0
   flutter_tts: ^4.2.0
+  audioplayers: ^6.1.0
 
   # App management
   installed_apps: ^1.5.0
@@ -31,6 +32,10 @@ dependencies:
   # Storage
   shared_preferences: ^2.3.0
   path_provider: ^2.1.0
+
+  # Attachments
+  file_picker: ^10.0.0
+  image_picker: ^1.1.2
 
   # Notifications
   flutter_local_notifications: ^18.0.0

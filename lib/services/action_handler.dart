@@ -9,6 +9,10 @@ import 'shizuku_service.dart';
 import 'screen_automation_service.dart';
 import 'task_executor.dart';
 import 'ai_service.dart';
+import 'search_service.dart';
+import 'camofox_service.dart';
+import 'sandbox_service.dart';
+import 'mcp_service.dart';
 
 class ActionHandler {
   final AppLauncherService _appLauncher = AppLauncherService();
@@ -18,12 +22,29 @@ class ActionHandler {
   final SystemControlService _systemControl = SystemControlService();
   final ShizukuService _shizuku = ShizukuService();
   final ScreenAutomationService _screenAutomation = ScreenAutomationService();
+  final SearchService _search = SearchService();
+  final SandboxService _sandbox = SandboxService();
+  final McpService _mcp = McpService();
 
   ShizukuService get shizuku => _shizuku;
   ScreenAutomationService get screenAutomation => _screenAutomation;
+  SearchService get search => _search;
+  CamofoxService get camofox => _search.camofox;
+  SandboxService get sandbox => _sandbox;
+  McpService get mcp => _mcp;
+
+  bool _integrationsInitialized = false;
 
   /// The currently running task executor, if any
   TaskExecutor? _currentExecutor;
+
+  Future<void> _ensureIntegrations() async {
+    if (_integrationsInitialized) return;
+    _integrationsInitialized = true;
+    await _search.init();
+    await _sandbox.init();
+    await _mcp.init();
+  }
 
   /// Execute an action and return the result
   Future<AgentActionResult> execute(
@@ -114,6 +135,50 @@ class ActionHandler {
           );
           break;
 
+        // ─── Web & knowledge tools ────────────────────────────
+
+        case 'web_search':
+          await _ensureIntegrations();
+          final query = action.params['query'] as String? ?? '';
+          onProgress?.call('Searching the web: "$query"');
+          result = await _search.search(query);
+          break;
+
+        case 'browse_page':
+          await _ensureIntegrations();
+          final url = action.params['url'] as String? ?? '';
+          onProgress?.call('Opening page: $url');
+          if (_search.provider == 'camofox' && _search.camofox.isConfigured) {
+            result = await _search.camofox.openPage(url);
+          } else {
+            // Lightweight fallback: plain HTTP GET + tag stripping.
+            result = await _fetchPlainText(url);
+          }
+          break;
+
+        // ─── Remote sandbox ───────────────────────────────────
+
+        case 'run_code':
+          await _ensureIntegrations();
+          final command = action.params['command'] as String? ?? '';
+          final language = action.params['language'] as String? ?? 'bash';
+          onProgress?.call('Running in sandbox: $command');
+          result = await _sandbox.execute(command, language: language);
+          break;
+
+        // ─── MCP plugins ──────────────────────────────────────
+
+        case 'mcp_call':
+          await _ensureIntegrations();
+          final server = action.params['server'] as String? ?? '';
+          final tool = action.params['tool'] as String? ?? '';
+          final args =
+              (action.params['arguments'] as Map?)?.cast<String, dynamic>() ??
+              <String, dynamic>{};
+          onProgress?.call('Calling MCP tool $tool on $server');
+          result = await _mcp.callTool(server, tool, args);
+          break;
+
         // ─── Screen Automation Actions ────────────────────────
 
         case 'read_screen':
@@ -181,8 +246,54 @@ class ActionHandler {
     }
   }
 
+  /// Minimal HTML -> text for browse_page when CamoFox is not configured.
+  Future<String> _fetchPlainText(String url) async {
+    final client = HttpClientWithTimeout();
+    return client.fetch(url);
+  }
+
   /// Cancel the currently running task
   void cancelTask() {
     _currentExecutor?.cancel();
+  }
+}
+
+/// Tiny helper kept separate so ActionHandler stays readable.
+class HttpClientWithTimeout {
+  Future<String> fetch(String url) async {
+    final uri = Uri.tryParse(url);
+    if (uri == null || !uri.hasScheme) {
+      throw Exception('Invalid URL: $url');
+    }
+    final response = await _get(uri);
+    var text = response;
+    text = text.replaceAll(
+      RegExp(r'<script[\s\S]*?</script>', caseSensitive: false),
+      ' ',
+    );
+    text = text.replaceAll(
+      RegExp(r'<style[\s\S]*?</style>', caseSensitive: false),
+      ' ',
+    );
+    text = text.replaceAll(RegExp(r'<[^>]+>'), ' ');
+    text = text.replaceAll(RegExp(r'\s+'), ' ').trim();
+    const maxChars = 8000;
+    if (text.length > maxChars) {
+      text = '${text.substring(0, maxChars)}...[truncated]';
+    }
+    return text;
+  }
+
+  Future<String> _get(Uri uri) async {
+    final client = 
+        (await _httpGet(uri).timeout(const Duration(seconds: 30)));
+    return client;
+  }
+
+  Future<String> _httpGet(Uri uri) async {
+    // Deferred import of package:http to keep one HTTP stack.
+    // ignore: avoid_dynamic_calls
+    final response = await (await _Http.get(uri));
+    return response;
   }
 }
